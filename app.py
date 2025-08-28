@@ -1,87 +1,74 @@
-# app.py — Sales Progression Tracker (UK)
-# - Gumroad license gate + admin override
-# - Uses your master OPENAI_API_KEY (kept in Streamlit Secrets)
-# - Daily usage cap + cooldown + midnight reset
-# - Paste email threads → extract conveyancing milestones → timeline + CSV/JSON
+# app.py — Sales Progression Tracker (UK, Pro+Docs+Pathway)
+# - Emails OR Doc uploads OR Free-text pathway description
+# - Corporate UI: KPIs, timeline, progress bar, blockers / next-actions
+# - Robust parsing + stage normalization (no schema crashes)
+# - Gumroad gate + Admin override + daily caps
+# - SQLite persistence per user (history across sessions)
 
-import os
-import json
-import time
-import datetime as dt
-import urllib.parse
-import urllib.request
-from typing import List, Optional, Literal, Dict, Any
+import os, re, io, json, time, hashlib, sqlite3, datetime as dt
+import urllib.parse, urllib.request
+from typing import Optional, Dict, Any, List, Tuple
 
 import pandas as pd
 import streamlit as st
-from pydantic import BaseModel, Field, ValidationError
 from openai import OpenAI
+from pypdf import PdfReader
+import docx2txt
 
-# ================== Secrets & Config ==================
+# -------------------- Config & Secrets --------------------
+st.set_page_config(page_title="Sales Progression Tracker", page_icon="📈", layout="wide")
+
 def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
-    """Read from Streamlit Secrets first, then env, then default."""
     try:
         return st.secrets.get(name, os.getenv(name, default))
     except Exception:
         return os.getenv(name, default)
 
-# Required
 OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
 DEFAULT_MODEL  = get_secret("OPENAI_DEFAULT_MODEL", "gpt-4o-mini")
-
-# License gate
 GUMROAD_PRODUCT_PERMALINK = get_secret("GUMROAD_PRODUCT_PERMALINK", "")
-ADMIN_BYPASS              = get_secret("ADMIN_BYPASS", "")  # leave blank to disable
-
-# Usage controls
-USAGE_DAILY_LIMIT      = int(get_secret("USAGE_DAILY_LIMIT", "100"))
+ADMIN_BYPASS   = get_secret("ADMIN_BYPASS", "")
+USAGE_DAILY_LIMIT      = int(get_secret("USAGE_DAILY_LIMIT", "150"))
 USAGE_COOLDOWN_SECONDS = int(get_secret("USAGE_COOLDOWN_SECONDS", "5"))
+SLA_PENDING_DAYS       = int(get_secret("SLA_PENDING_DAYS", "10"))
 
-# ================== Page & Styles ==================
-st.set_page_config(page_title="Sales Progression Tracker", page_icon="📈", layout="wide")
+if not OPENAI_API_KEY:
+    st.error("Server misconfigured: missing OPENAI_API_KEY in Secrets.")
+    st.stop()
+
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+# -------------------- Styles --------------------
 st.markdown("""
 <style>
-.block-container { padding-top: 1.25rem; }
-.result-card { border:1px solid #e8e8e8; border-radius:12px; padding:14px; background:#fff; }
-.small { color:#666; font-size:0.9rem; }
-div.stButton > button, div.stDownloadButton > button { border-radius: 10px; padding: 0.55rem 1rem; }
+:root { --card:#fff; --muted:#6b7280; --border:#e5e7eb; --shadow: 0 6px 24px rgba(0,0,0,.06); }
+.block-container { padding-top: 1.2rem; }
+.card { border:1px solid var(--border); background:var(--card); border-radius:16px; padding:16px; box-shadow:var(--shadow); }
+.kpi { border:1px solid var(--border); border-radius:14px; padding:14px; background:var(--card); text-align:center; box-shadow:var(--shadow); }
+.small { color:var(--muted); font-size:.9rem }
+div.stButton>button, div.stDownloadButton>button { border-radius:10px; padding:.6rem 1rem; }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("📈 Sales Progression Tracker (UK)")
-if not st.session_state.get("licensed", False):
-    st.caption("Unlock with your Gumroad key. Admins can use a private override code.")
-
-# ================== Guards ==================
-if not OPENAI_API_KEY:
-    st.error("Server misconfigured: missing OPENAI_API_KEY (add it in Streamlit Secrets).")
-    st.stop()
-
-# ================== Session State ==================
+# -------------------- Session --------------------
 if "licensed" not in st.session_state:
     st.session_state.licensed = False
 if "usage" not in st.session_state:
-    st.session_state.usage = {
-        "date": dt.date.today().isoformat(),
-        "count": 0,
-        "last_ts": 0.0,
-        "bypass": False,  # True after admin override
-    }
+    st.session_state.usage = {"date": dt.date.today().isoformat(), "count": 0, "last_ts": 0.0, "bypass": False}
+if "uid" not in st.session_state:
+    st.session_state.uid = None  # set after unlock
 
-# ================== License Helpers ==================
+# -------------------- Gumroad gate --------------------
 def verify_gumroad_license(license_key: str, product_permalink: str) -> bool:
-    """Return True if the Gumroad license is valid for the product. No external deps."""
     try:
         data = urllib.parse.urlencode({
             "product_permalink": product_permalink,
             "license_key": license_key,
             "increment_uses_count": "false",
         }).encode("utf-8")
-        req = urllib.request.Request(
-            "https://api.gumroad.com/v2/licenses/verify",
-            data=data, method="POST",
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
+        req = urllib.request.Request("https://api.gumroad.com/v2/licenses/verify",
+                                     data=data, method="POST",
+                                     headers={"Content-Type":"application/x-www-form-urlencoded"})
         with urllib.request.urlopen(req, timeout=10) as resp:
             j = json.loads(resp.read().decode("utf-8"))
         return bool(j.get("success"))
@@ -89,65 +76,81 @@ def verify_gumroad_license(license_key: str, product_permalink: str) -> bool:
         return False
 
 def show_license_gate():
-    st.info("🔒 Enter your Access Key to unlock.", icon="🔑")
-    with st.form("license_form"):
-        access_key = st.text_input("Access Key", placeholder="Your Gumroad key", type="password")
-        ok = st.form_submit_button("Unlock")
-
+    st.title("📈 Sales Progression Tracker (UK)")
+    st.caption("Unlock with your Gumroad key. Admins can use an override code.")
+    with st.form("license"):
+        access = st.text_input("Access Key", type="password")
+        ok = st.form_submit_button("Unlock", use_container_width=True)
     if ok:
-        # Admin override first
-        if ADMIN_BYPASS and access_key.strip() == ADMIN_BYPASS.strip():
+        # Admin bypass
+        if ADMIN_BYPASS and access.strip() == ADMIN_BYPASS.strip():
             st.session_state.usage["bypass"] = True
             st.session_state.licensed = True
+            st.session_state.uid = "admin:" + hashlib.sha256(access.encode()).hexdigest()[:16]
             st.success("Admin override accepted ✅")
             st.rerun()
-
-        # Otherwise validate with Gumroad
+        # Gumroad verify
         if not GUMROAD_PRODUCT_PERMALINK:
-            st.error("Server misconfigured: missing GUMROAD_PRODUCT_PERMALINK in Secrets.")
+            st.error("Missing GUMROAD_PRODUCT_PERMALINK in Secrets.")
             st.stop()
-
-        valid = verify_gumroad_license(access_key.strip(), GUMROAD_PRODUCT_PERMALINK)
+        valid = verify_gumroad_license(access.strip(), GUMROAD_PRODUCT_PERMALINK)
         if valid:
             st.session_state.licensed = True
+            st.session_state.uid = "gum:" + hashlib.sha256(access.encode()).hexdigest()[:16]
             st.success("License verified ✅")
             st.rerun()
         else:
-            st.error("Invalid access key. Please check your key or contact support.")
+            st.error("Invalid key. Please try again or contact support.")
 
-# Show gate if not yet licensed
 if not st.session_state.licensed:
     show_license_gate()
-    if not st.session_state.licensed:
-        st.stop()
+    if not st.session_state.licensed: st.stop()
 
-# ================== OpenAI Client ==================
-client = OpenAI(api_key=OPENAI_API_KEY)
+UID = st.session_state.uid or "anon"
 
-# ================== Sidebar (Models & Usage) ==================
-with st.sidebar:
-    st.header("⚙️ Settings")
+# -------------------- Persistence (SQLite) --------------------
+DB_PATH = "progress.db"
 
-    # De-duplicated models (DEFAULT first)
-    models = list(dict.fromkeys([DEFAULT_MODEL, "gpt-4o-mini", "gpt-4.1", "gpt-5-mini"]))
-    model = st.selectbox("Model", options=models, index=0)
+def db_conn():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.execute("""CREATE TABLE IF NOT EXISTS cases(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        uid TEXT NOT NULL,
+        name TEXT NOT NULL,
+        created_ts INTEGER NOT NULL,
+        input_text TEXT,
+        source TEXT,          -- emails|docs|description
+        milestones_json TEXT, -- normalized list
+        progress REAL,
+        summary TEXT
+    )""")
+    conn.commit()
+    return conn
 
-    st.markdown("---")
-    # Midnight reset for local timezone
-    today = dt.date.today().isoformat()
-    if st.session_state.usage["date"] != today:
-        st.session_state.usage["date"] = today
-        st.session_state.usage["count"] = 0
-        st.session_state.usage["last_ts"] = 0.0
+def db_save_case(uid: str, name: str, in_text: str, source: str,
+                 milestones: List[Dict[str,Any]], progress: float, summary: str) -> int:
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute("INSERT INTO cases(uid,name,created_ts,input_text,source,milestones_json,progress,summary) VALUES (?,?,?,?,?,?,?,?)",
+                (uid, name, int(time.time()), in_text, source, json.dumps(milestones), float(progress), summary))
+    conn.commit()
+    return cur.lastrowid
 
-    is_admin = bool(st.session_state.usage.get("bypass"))
-    remaining = "∞" if is_admin else max(0, USAGE_DAILY_LIMIT - st.session_state.usage["count"])
-    st.metric(label="Generations left (today)", value=remaining)
-    if is_admin:
-        st.success("Admin bypass active")
+def db_list_cases(uid: str, limit: int = 25) -> List[Dict[str,Any]]:
+    conn = db_conn()
+    rows = conn.execute("SELECT id,name,created_ts,progress FROM cases WHERE uid=? ORDER BY id DESC LIMIT ?", (uid, limit)).fetchall()
+    return [{"id":r[0],"name":r[1],"ts":r[2],"progress":r[3]} for r in rows]
 
-# ================== Schema (Pydantic) ==================
-StageName = Literal[
+def db_get_case(uid: str, case_id: int) -> Optional[Dict[str,Any]]:
+    conn = db_conn()
+    r = conn.execute("SELECT id,name,created_ts,input_text,source,milestones_json,progress,summary FROM cases WHERE uid=? AND id=?",
+                     (uid, case_id)).fetchone()
+    if not r: return None
+    return {"id":r[0],"name":r[1],"ts":r[2],"input":r[3],"source":r[4],"milestones":json.loads(r[5] or "[]"),
+            "progress":r[6],"summary":r[7]}
+
+# -------------------- Canonical stages & mapping --------------------
+CANONICAL = [
     "Offer Received","Offer Accepted","Memorandum of Sale",
     "ID/AML Checks","Mortgage Application","Mortgage Offer",
     "Survey / Valuation","Searches Ordered","Searches Returned",
@@ -155,225 +158,334 @@ StageName = Literal[
     "Exchange of Contracts","Completion","Fall-through","Other"
 ]
 
-class Milestone(BaseModel):
-    stage: StageName
-    status: Literal["done","pending","blocked"] = Field(description="Current status")
-    date_iso: Optional[str] = Field(default=None, description="YYYY-MM-DD if known")
-    actor: Optional[str] = Field(default=None, description="agent|solicitor|buyer|seller|lender|other")
-    details: Optional[str] = None
-    blockers: Optional[str] = None
-    next_action: Optional[str] = None
-    confidence: int = Field(ge=0, le=100, default=70)
-    source_quote: Optional[str] = None
+STAGE_ORDER = {name:i for i,name in enumerate(CANONICAL)}  # for progress calc
 
-class Extraction(BaseModel):
-    property_ref: Optional[str] = None
-    buyer: Optional[str] = None
-    seller: Optional[str] = None
-    milestones: List[Milestone]
+_STAGE_MAP = [
+    (r"\boffer (received|made)\b",             "Offer Received"),
+    (r"\boffer accepted\b|\bagreed\b",         "Offer Accepted"),
+    (r"\bmemorandum of sale|\bmos\b",          "Memorandum of Sale"),
+    (r"\baml\b|\bid\b|\bkyc\b",                "ID/AML Checks"),
+    (r"\bmortgage application\b|\baip\b",      "Mortgage Application"),
+    (r"\bmortgage offer\b|\boffer issued\b",   "Mortgage Offer"),
+    (r"\bvaluation\b|\bsurvey(or)?\b|\bsurvey\b", "Survey / Valuation"),
+    (r"\bsearches (ordered|applied)\b",        "Searches Ordered"),
+    (r"\bsearches (returned|back|received)\b", "Searches Returned"),
+    (r"\bdraft contract(s)? issued\b|\bcontract pack\b", "Draft Contracts Issued"),
+    (r"\benquiries (raised|sent)\b",           "Enquiries Raised"),
+    (r"\breplies to enquiries|\benquiries answered\b", "Enquiries Answered"),
+    (r"\bexchange\b|\bexchanged\b",            "Exchange of Contracts"),
+    (r"\bcompletion\b|\bcomplete on\b",        "Completion"),
+    (r"\bfall[- ]?through\b|\bchain collapsed\b", "Fall-through"),
+]
 
-# ================== Prompt Builder (quote-safe) ==================
-SYSTEM = "You are a UK residential conveyancing assistant. Extract structured milestones. Never invent dates or outcomes."
+def normalize_stage(raw: str) -> str:
+    if not raw: return "Other"
+    text = raw.lower().strip()
+    for pat, dst in _STAGE_MAP:
+        if re.search(pat, text): return dst
+    for c in CANONICAL:
+        if c.lower() in text: return c
+    return "Other"
 
-def build_prompt(thread_text: str) -> str:
-    thread = (thread_text or "").strip()[:100_000]
-    # No nested triple-quotes; safe string assembly.
+# -------------------- Model prompts --------------------
+SYSTEM_LAW = (
+    "You are a UK residential conveyancing assistant. Follow UK practice from instruction to completion. "
+    "Do NOT invent dates or outcomes. Keep responses factual and concise."
+)
+
+def prompt_extract(thread_or_desc: str) -> str:
+    t = (thread_or_desc or "").strip()[:100_000]
     return (
-        "Parse the following email/notes thread about a property sale progression.\n"
-        "Return ONLY JSON matching the schema shown after the thread.\n\n"
-        "Rules:\n"
-        "- Use UK conveyancing stages when possible.\n"
-        "- Only set status=\"done\" if the email clearly confirms completion.\n"
-        "- Use ISO dates (YYYY-MM-DD) when a date is explicit; otherwise leave null.\n"
-        "- Keep details factual; include one short source_quote if helpful.\n\n"
-        "THREAD START >>>\n"
-        f"{thread}\n"
-        "<<< THREAD END\n\n"
-        "JSON schema (shape, not types):\n"
-        "{\n"
-        '  "property_ref": "... or null",\n'
-        '  "buyer": "... or null",\n'
-        '  "seller": "... or null",\n'
-        '  "milestones": [\n'
-        "     {\n"
-        '       "stage": "...",\n'
-        '       "status": "done|pending|blocked",\n'
-        '       "date_iso": "YYYY-MM-DD or null",\n'
-        '       "actor": "agent|solicitor|buyer|seller|lender|other",\n'
-        '       "details": "...",\n'
-        '       "blockers": "... or null",\n'
-        '       "next_action": "... or null",\n'
-        '       "confidence": 0-100,\n'
-        '       "source_quote": "... or null"\n'
-        "     }\n"
-        "  ]\n"
-        "}\n"
+        "From the following text (emails, notes, or description), identify progression milestones in a UK residential sale. "
+        "For each milestone return: stage, status (done|pending|blocked), date_iso (YYYY-MM-DD or null), "
+        "actor (agent|solicitor|buyer|seller|lender|other), details, blockers, next_action.\n\n"
+        f"TEXT START >>>\n{t}\n<<< TEXT END\n\n"
+        "Return ONLY JSON like:\n"
+        "{ \"milestones\": [ {\"stage\":\"\",\"status\":\"pending\",\"date_iso\":null,\"actor\":\"other\",\"details\":\"\",\"blockers\":null,\"next_action\":null} ] }"
     )
 
-# ================== UI ==================
-with st.form("extract_form", clear_on_submit=False):
-    st.subheader("Paste Email/Notes Thread")
-    sample = st.toggle("Load sample thread")
-    if sample:
-        SAMPLE = (
-            "From: Buyer’s Solicitor\n"
-            "Subject: Searches ordered\n"
-            "We confirm local authority and water searches were ordered on 12/08/2025. "
-            "Results expected within 10 working days.\n\n"
-            "From: Lender\n"
-            "Subject: Valuation Report\n"
-            "The valuation was carried out on 10/08/2025. Report due 13/08/2025.\n\n"
-            "From: Agent\n"
-            "Subject: Offer accepted\n"
-            "Vendor accepted buyer’s offer of £425,000 on 08/08/2025. "
-            "Memorandum of Sale issued to both solicitors.\n\n"
-            "From: Seller’s Solicitor\n"
-            "Subject: Draft contract pack\n"
-            "Draft contracts issued 15/08/2025. Awaiting enquiries from buyer’s side."
+def prompt_summary(milestones: List[Dict[str,Any]]) -> str:
+    return (
+        "Write a client-facing status summary of this case. "
+        "Use short paragraphs and a final section with bullet points under headings 'Action to take' and 'Waiting for'. "
+        "Keep it UK property tone, professional, concise.\n\n"
+        f"DATA:\n{json.dumps(milestones, ensure_ascii=False)}"
+    )
+
+# -------------------- LLM helpers --------------------
+def chat_json(model: str, system: str, user: str, max_tokens: int = 1400, temperature: float = 0.2) -> Dict[str, Any]:
+    for _ in range(2):
+        r = client.chat.completions.create(
+            model=model,
+            temperature=temperature,
+            response_format={"type":"json_object"},
+            messages=[{"role":"system","content":system},{"role":"user","content":user}],
+            max_tokens=max_tokens,
         )
-        st.session_state["thread_text"] = SAMPLE
+        text = (r.choices[0].message.content or "").strip()
+        try:
+            return json.loads(text)
+        except Exception:
+            time.sleep(0.6)
+    raise RuntimeError("Model did not return valid JSON.")
 
-    thread_text = st.text_area(
-        "Email / notes thread",
-        value=st.session_state.get("thread_text", ""),
-        height=340,
-        placeholder="Paste solicitor/agent emails here (any order). Dates help: e.g., 'issued 15/08/2025'.",
-    )
+# -------------------- Utilities --------------------
+def read_file_to_text(uploaded_file) -> str:
+    name = uploaded_file.name.lower()
+    data = uploaded_file.read()
+    if name.endswith(".txt"):
+        try: return data.decode("utf-8")
+        except: return data.decode("latin-1", errors="ignore")
+    if name.endswith(".pdf"):
+        reader = PdfReader(io.BytesIO(data))
+        return "\n".join(page.extract_text() or "" for page in reader.pages)
+    if name.endswith(".docx"):
+        bio = io.BytesIO(data)
+        return docx2txt.process(bio) or ""
+    return ""
 
-    submitted = st.form_submit_button("🔎 Extract Milestones", type="primary", use_container_width=True)
+def normalize_rows(rows: List[Dict[str, Any]], dedupe: bool, strict_dates: bool) -> List[Dict[str, Any]]:
+    norm, seen = [], set()
+    for r in rows or []:
+        stage = normalize_stage(str(r.get("stage","")))
+        status = str(r.get("status","pending")).lower()
+        status = status if status in {"done","pending","blocked"} else "pending"
+        date_iso = r.get("date_iso")
 
-# ================== Caps + Cooldown ==================
-def enforce_usage_caps() -> Optional[str]:
-    """Returns an error message if a cap is violated, else None."""
+        # convert 18/08/25 → 2025-08-18, else keep YYYY-MM-DD, else None
+        if isinstance(date_iso, str) and date_iso.strip():
+            s = date_iso.strip()
+            if re.match(r"^\d{2}/\d{2}/\d{2,4}$", s):
+                d,m,y = s.split("/")
+                y = "20"+y if len(y)==2 else y
+                try: date_iso = dt.date(int(y), int(m), int(d)).isoformat()
+                except: date_iso = None
+            elif not re.match(r"^\d{4}-\d{2}-\d{2}$", s):
+                date_iso = None
+
+        actor = str(r.get("actor") or "other").lower()
+        actor = actor if actor in {"agent","solicitor","buyer","seller","lender","other"} else "other"
+        details = (r.get("details") or "").strip()
+        blockers = (r.get("blockers") or None)
+        next_action = (r.get("next_action") or None)
+
+        if strict_dates and status=="done" and not date_iso:
+            status = "pending"
+
+        key = (stage, status, date_iso or "", actor, details[:80])
+        if dedupe and key in seen: continue
+        seen.add(key)
+
+        norm.append({"stage":stage,"status":status,"date":date_iso,"actor":actor,
+                     "details":details,"blockers":blockers,"next_action":next_action})
+    return norm
+
+def compute_progress(rows: List[Dict[str,Any]]) -> float:
+    """% complete based on highest 'done' stage in canonical path (ignores 'Other' & Fall-through)."""
+    done_indices = [STAGE_ORDER.get(r["stage"], -1) for r in rows if r["status"]=="done" and r["stage"] in STAGE_ORDER]
+    if not done_indices: return 3.0  # small nudge on first step
+    last = max(done_indices)
+    max_index = STAGE_ORDER["Completion"]
+    pct = max(0.0, min(100.0, (last / max_index) * 100.0))
+    return round(pct, 1)
+
+def enforce_caps() -> Optional[str]:
     usage = st.session_state.usage
     now = time.time()
-
-    if not usage.get("bypass"):  # skip caps for admin override
+    # midnight reset
+    today = dt.date.today().isoformat()
+    if usage["date"] != today:
+        usage.update({"date":today, "count":0, "last_ts":0.0})
+    if not usage.get("bypass"):
         if usage["count"] >= USAGE_DAILY_LIMIT:
-            reset_at = dt.datetime.combine(dt.date.today() + dt.timedelta(days=1), dt.time.min)
-            mins_left = int((reset_at - dt.datetime.now()).total_seconds() // 60)
+            reset_at = dt.datetime.combine(dt.date.today()+dt.timedelta(days=1), dt.time.min)
+            mins_left = int((reset_at - dt.datetime.now()).total_seconds()//60)
             return f"Daily limit reached. Resets in ~{mins_left} minutes."
-
         since = now - float(usage["last_ts"])
         if since < USAGE_COOLDOWN_SECONDS:
             wait = int(USAGE_COOLDOWN_SECONDS - since + 1)
             return f"Please wait {wait}s before generating again."
-
-    # Update counters later only on success
     return None
 
-# ================== Extraction ==================
-def extract(thread_text: str) -> Extraction:
-    resp = client.chat.completions.create(
-        model=model,
-        temperature=0.2,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": SYSTEM},
-            {"role": "user", "content": build_prompt(thread_text)},
-        ],
-        max_tokens=1200,
-    )
-    raw = resp.choices[0].message.content or "{}"
-    data = json.loads(raw)
-    return Extraction.model_validate(data)
+# -------------------- Sidebar --------------------
+with st.sidebar:
+    st.header("⚙️ Settings")
+    models = list(dict.fromkeys([DEFAULT_MODEL, "gpt-4o-mini", "gpt-4.1", "gpt-5-mini"]))
+    model = st.selectbox("Model", options=models, index=0)
+    st.markdown("---")
+    is_admin = bool(st.session_state.usage.get("bypass"))
+    remain = "∞" if is_admin else max(0, USAGE_DAILY_LIMIT - st.session_state.usage["count"])
+    c1, c2 = st.columns(2)
+    c1.metric("Generations left", remain)
+    c2.metric("Cooldown (s)", USAGE_COOLDOWN_SECONDS)
+    if is_admin: st.success("Admin bypass active")
 
-def to_df(ex: Extraction) -> pd.DataFrame:
-    rows = []
-    for m in ex.milestones:
-        rows.append({
-            "stage": m.stage,
-            "status": m.status,
-            "date": m.date_iso,
-            "actor": m.actor,
-            "details": m.details,
-            "blockers": m.blockers,
-            "next_action": m.next_action,
-            "confidence": m.confidence,
-        })
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df
+    st.markdown("---")
+    st.subheader("📁 Your saved cases")
+    items = db_list_cases(UID, 25)
+    if not items:
+        st.caption("No cases saved yet.")
+    else:
+        for it in items:
+            when = dt.datetime.fromtimestamp(it["ts"]).strftime("%d %b %Y %H:%M")
+            st.write(f"• **{it['name']}** — {it['progress']}%  \n<span class='small'>{when}</span>", unsafe_allow_html=True)
+        st.caption("Cases persist per user key. (For durable cloud storage across redeploys, migrate to Supabase.)")
 
-    # Sort by date (known first), then status, then stage
-    def sort_key(row):
-        d = row.get("date")
-        try:
-            t = dt.datetime.fromisoformat(d).timestamp() if d else float("inf")
-        except Exception:
-            t = float("inf")
-        status_rank = {"done": 0, "pending": 1, "blocked": 2}.get(str(row.get("status")), 3)
-        return (t, status_rank, str(row.get("stage")))
+# -------------------- Input Modes --------------------
+st.title("📈 Sales Progression Tracker (UK)")
+st.caption("Paste emails, upload docs, or describe the process. Get progress, timeline, and next steps.")
 
-    df["__k__"] = df.apply(sort_key, axis=1)
-    df = df.sort_values("__k__").drop(columns="__k__")
-    return df
+mode = st.tabs(["Emails / Notes", "Upload Documents", "Describe Process"])
 
-# ================== Submit Logic ==================
-if submitted:
-    if not thread_text.strip():
-        st.error("Paste an email thread first.")
+with mode[0]:
+    st.markdown("#### Paste emails / notes")
+    emails_text = st.text_area("Emails or notes (any order)", height=280, key="emails_text")
+with mode[1]:
+    st.markdown("#### Upload documents (.txt, .pdf, .docx)")
+    uploads = st.file_uploader("Attach 1–5 files", type=["txt","pdf","docx"], accept_multiple_files=True)
+with mode[2]:
+    st.markdown("#### Describe the process in your own words")
+    desc_text = st.text_area("Describe what's happened so far, who did what, and any dates", height=220, key="desc_text")
+
+st.markdown("---")
+colA, colB, colC, colD = st.columns([1,1,1,1])
+with colA:
+    case_name = st.text_input("Case name / address (for saving)", placeholder="e.g., 12 Acacia Ave, SW1")
+with colB:
+    dedupe = st.checkbox("De-duplicate", value=True)
+with colC:
+    strict_dates = st.checkbox("Require date for 'done'", value=False)
+with colD:
+    show_age = st.checkbox("Highlight aged pending", value=True)
+
+go = st.button("🔎 Analyse & Generate Report", type="primary", use_container_width=True)
+
+# -------------------- Run --------------------
+if go:
+    # Build input text
+    source = "emails"
+    blob = ""
+    if emails_text and emails_text.strip():
+        blob = emails_text.strip()
+    elif uploads:
+        source = "docs"
+        parts = []
+        for up in uploads[:5]:
+            parts.append(read_file_to_text(up))
+        blob = "\n\n".join(parts).strip()
+    elif desc_text and desc_text.strip():
+        source = "description"
+        blob = desc_text.strip()
+    else:
+        st.error("Provide emails, upload documents, or enter a description first.")
         st.stop()
 
-    msg = enforce_usage_caps()
+    # Caps/cooldown
+    msg = enforce_caps()
     if msg:
-        st.warning(msg)
-        st.stop()
+        st.warning(msg); st.stop()
 
+    # LLM extraction
     with st.spinner("Extracting milestones…"):
         try:
-            ex = extract(thread_text)
-            df = to_df(ex)
-        except ValidationError as ve:
-            st.error("Model output didn’t match the schema. Try again.")
-            st.code(str(ve))
-            st.stop()
+            j = chat_json(model, SYSTEM_LAW, prompt_extract(blob))
+            raw_rows = (j or {}).get("milestones") or []
         except Exception as e:
-            st.error(f"Extraction failed: {e}")
-            st.stop()
+            st.error(f"Model error: {e}"); st.stop()
 
-    # Update usage counters (success only)
+    rows = normalize_rows(raw_rows, dedupe=dedupe, strict_dates=strict_dates)
+    df = pd.DataFrame(rows)
+
+    # Compute progress
+    pct = compute_progress(rows)
+
+    # Executive summary
+    try:
+        s_json = chat_json(model, SYSTEM_LAW, prompt_summary(rows), max_tokens=600)
+        summary_text = s_json.get("summary") or s_json.get("text") or ""
+        bullets = s_json.get("bullets") or []
+    except Exception:
+        summary_text, bullets = "", []
+
+    # Update usage
     st.session_state.usage["count"] += 1
     st.session_state.usage["last_ts"] = time.time()
 
-    # Render
-    st.subheader("Results")
-    if df.empty:
-        st.info("No milestones found. Try including dates or clearer statements in the thread.")
-    else:
-        colL, colR = st.columns([2, 1], gap="large")
+    # Save case if name given
+    case_id = None
+    if case_name.strip():
+        case_id = db_save_case(UID, case_name.strip(), blob[:4000], source, rows, pct, summary_text)
 
-        with colR:
-            st.subheader("Timeline")
-            def badge(s): return {"done": "✅", "pending": "🕒", "blocked": "⛔"}.get(str(s), "•")
+    # -------------------- UI: Results --------------------
+    k1, k2, k3, k4 = st.columns(4)
+    k1.markdown(f"<div class='kpi'><b>Progress</b><br>{pct}%</div>", unsafe_allow_html=True)
+    k2.markdown(f"<div class='kpi'><b>Done</b><br>{int((df['status']=='done').sum())}</div>", unsafe_allow_html=True)
+    k3.markdown(f"<div class='kpi'><b>Pending</b><br>{int((df['status']=='pending').sum())}</div>", unsafe_allow_html=True)
+    k4.markdown(f"<div class='kpi'><b>Blocked</b><br>{int((df['status']=='blocked').sum())}</div>", unsafe_allow_html=True)
+
+    st.progress(int(pct))
+
+    left, right = st.columns([2,1], gap="large")
+
+    with right:
+        st.markdown("### Timeline")
+        def badge(s): return {"done":"✅","pending":"🕒","blocked":"⛔"}.get(s,"•")
+        if df.empty:
+            st.info("No milestones detected.")
+        else:
+            # Sort by date/status/stage
+            def _key(row):
+                d = row.get("date")
+                try: t = dt.datetime.fromisoformat(d).timestamp() if d else float("inf")
+                except: t = float("inf")
+                rank = {"done":0,"pending":1,"blocked":2}.get(row.get("status","pending"),3)
+                return (t,rank,row.get("stage",""))
+            df["__k__"] = df.apply(_key, axis=1)
+            df = df.sort_values("__k__").drop(columns="__k__")
+
             for _, r in df.iterrows():
                 date_txt = f" — {r['date']}" if r.get("date") else ""
-                details  = (str(r.get("details") or "")).strip()
-                st.markdown(f"**{badge(r['status'])} {r['stage']}**{date_txt}  \n*{details}*")
-            st.markdown("---")
-            done = int((df["status"] == "done").sum())
-            pending = int((df["status"] == "pending").sum())
-            blocked = int((df["status"] == "blocked").sum())
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Done", done); c2.metric("Pending", pending); c3.metric("Blocked", blocked)
+                actor = (r.get("actor") or "").capitalize()
+                det = (r.get("details") or "").strip()
+                st.markdown(f"**{badge(r['status'])} {r['stage']}**{date_txt}  \n<small class='small'>{actor}</small>  \n*{det}*", unsafe_allow_html=True)
 
-        with colL:
-            st.subheader("Milestones (table)")
-            st.dataframe(df, use_container_width=True, height=280)
+            if show_age:
+                today = dt.date.today()
+                aged = []
+                for _, r in df[df["status"]=="pending"].iterrows():
+                    d = r.get("date")
+                    if d:
+                        try:
+                            days = (today - dt.date.fromisoformat(d)).days
+                            if days >= SLA_PENDING_DAYS: aged.append((r["stage"], days))
+                        except: pass
+                if aged:
+                    st.markdown("<hr/>", unsafe_allow_html=True)
+                    st.warning("Pending items older than SLA:")
+                    for s, days in aged:
+                        st.write(f"- {s}: {days} days")
 
-            # Downloads
-            dump = ex.model_dump()
-            c1, c2, c3 = st.columns(3)
-            c1.download_button("⬇️ JSON", data=json.dumps(dump, indent=2).encode("utf-8"),
-                               file_name="progression.json", mime="application/json",
-                               use_container_width=True)
-            c2.download_button("⬇️ CSV", data=df.to_csv(index=False).encode("utf-8"),
-                               file_name="progression.csv", mime="text/csv",
-                               use_container_width=True)
-            def clear_state():
-                st.session_state["thread_text"] = ""
-            c3.button("🔁 Clear", on_click=clear_state, use_container_width=True)
+    with left:
+        st.markdown("### Status Report")
+        if summary_text:
+            st.write(summary_text)
+        if bullets:
+            st.markdown("**Action to take / Waiting for**")
+            for b in bullets: st.markdown(f"- {b}")
 
-st.markdown("---")
-st.caption("🔐 Locked by Gumroad key (with admin override). Contact: support@yourdomain.com")
+        st.markdown("### Milestones (table)")
+        st.dataframe(df, use_container_width=True, height=340)
 
+        # Exports
+        dump = {"source": source, "progress": pct, "milestones": rows}
+        c1, c2 = st.columns(2)
+        c1.download_button("⬇️ JSON", data=json.dumps(dump, indent=2).encode("utf-8"),
+                           file_name="progression.json", mime="application/json", use_container_width=True)
+        c2.download_button("⬇️ CSV", data=df.to_csv(index=False).encode("utf-8"),
+                           file_name="progression.csv", mime="text/csv", use_container_width=True)
+
+        if case_id:
+            st.success(f"Saved as case #{case_id} — “{case_name}”. View in sidebar.")
+
+st.markdown("<hr/>", unsafe_allow_html=True)
+st.caption("🔐 Gumroad-locked (admin override available). Cases saved per user key. © Relura")
