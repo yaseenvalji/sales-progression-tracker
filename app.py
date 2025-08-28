@@ -1,19 +1,27 @@
-# app.py — Sales Progression Tracker (UK, Pro+Docs+Pathway)
-# - Emails OR Doc uploads OR Free-text pathway description
-# - Corporate UI: KPIs, timeline, progress bar, blockers / next-actions
-# - Robust parsing + stage normalization (no schema crashes)
-# - Gumroad gate + Admin override + daily caps
-# - SQLite persistence per user (history across sessions)
+# app.py — Sales Progression Tracker (UK, Pro)
+# Emails OR Doc uploads OR Free-text description
+# Corporate UI: KPIs, timeline, progress bar, blockers / next-actions
+# Robust parsing + stage normalization (no schema crashes)
+# Gumroad gate + Admin override + daily caps
+# SQLite persistence per user (history across sessions)
 
 import os, re, io, json, time, hashlib, sqlite3, datetime as dt
 import urllib.parse, urllib.request
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List
 
 import pandas as pd
 import streamlit as st
 from openai import OpenAI
-from pypdf import PdfReader
-import docx2txt
+
+# Optional readers (only load if used)
+try:
+    from pypdf import PdfReader
+except Exception:
+    PdfReader = None
+try:
+    import docx2txt
+except Exception:
+    docx2txt = None
 
 # -------------------- Config & Secrets --------------------
 st.set_page_config(page_title="Sales Progression Tracker", page_icon="📈", layout="wide")
@@ -38,15 +46,38 @@ if not OPENAI_API_KEY:
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# -------------------- Styles --------------------
+# -------------------- Styles (high-contrast in light & dark) --------------------
 st.markdown("""
 <style>
-:root { --card:#fff; --muted:#6b7280; --border:#e5e7eb; --shadow: 0 6px 24px rgba(0,0,0,.06); }
-.block-container { padding-top: 1.2rem; }
-.card { border:1px solid var(--border); background:var(--card); border-radius:16px; padding:16px; box-shadow:var(--shadow); }
-.kpi { border:1px solid var(--border); border-radius:14px; padding:14px; background:var(--card); text-align:center; box-shadow:var(--shadow); }
-.small { color:var(--muted); font-size:.9rem }
+/* Theme-aware variables */
+@media (prefers-color-scheme: light) {
+  :root {
+    --fg:#111827; --muted:#6b7280; --card:#ffffff; --border:#e5e7eb;
+    --shadow: 0 6px 24px rgba(0,0,0,.06); --accent:#2563eb;
+  }
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg:#e5e7eb; --muted:#94a3b8; --card:#0f172a; --border:#1f2937;
+    --shadow: 0 8px 28px rgba(0,0,0,.45); --accent:#3b82f6;
+  }
+}
+
+/* Layout + cards */
+.block-container { padding-top: 1.1rem; }
+.card, .kpi {
+  border:1px solid var(--border);
+  background:var(--card);
+  border-radius:16px; padding:16px; box-shadow:var(--shadow);
+}
+.card, .card * { color: var(--fg) !important; text-shadow:none !important; opacity:1 !important; }
+.kpi, .kpi * { color: var(--fg) !important; text-shadow:none !important; opacity:1 !important; }
+
+.small { color:var(--muted) !important; font-size:.9rem }
+h1, h2, h3 { letter-spacing:.2px }
 div.stButton>button, div.stDownloadButton>button { border-radius:10px; padding:.6rem 1rem; }
+hr { border:none; border-top:1px solid var(--border); margin: 18px 0; }
+.progress-label { display:flex; justify-content:space-between; font-size:.9rem; color:var(--muted); margin-top:6px;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -119,8 +150,8 @@ def db_conn():
         name TEXT NOT NULL,
         created_ts INTEGER NOT NULL,
         input_text TEXT,
-        source TEXT,          -- emails|docs|description
-        milestones_json TEXT, -- normalized list
+        source TEXT,
+        milestones_json TEXT,
         progress REAL,
         summary TEXT
     )""")
@@ -141,14 +172,6 @@ def db_list_cases(uid: str, limit: int = 25) -> List[Dict[str,Any]]:
     rows = conn.execute("SELECT id,name,created_ts,progress FROM cases WHERE uid=? ORDER BY id DESC LIMIT ?", (uid, limit)).fetchall()
     return [{"id":r[0],"name":r[1],"ts":r[2],"progress":r[3]} for r in rows]
 
-def db_get_case(uid: str, case_id: int) -> Optional[Dict[str,Any]]:
-    conn = db_conn()
-    r = conn.execute("SELECT id,name,created_ts,input_text,source,milestones_json,progress,summary FROM cases WHERE uid=? AND id=?",
-                     (uid, case_id)).fetchone()
-    if not r: return None
-    return {"id":r[0],"name":r[1],"ts":r[2],"input":r[3],"source":r[4],"milestones":json.loads(r[5] or "[]"),
-            "progress":r[6],"summary":r[7]}
-
 # -------------------- Canonical stages & mapping --------------------
 CANONICAL = [
     "Offer Received","Offer Accepted","Memorandum of Sale",
@@ -157,8 +180,7 @@ CANONICAL = [
     "Draft Contracts Issued","Enquiries Raised","Enquiries Answered",
     "Exchange of Contracts","Completion","Fall-through","Other"
 ]
-
-STAGE_ORDER = {name:i for i,name in enumerate(CANONICAL)}  # for progress calc
+STAGE_ORDER = {name:i for i,name in enumerate(CANONICAL)}
 
 _STAGE_MAP = [
     (r"\boffer (received|made)\b",             "Offer Received"),
@@ -180,7 +202,7 @@ _STAGE_MAP = [
 
 def normalize_stage(raw: str) -> str:
     if not raw: return "Other"
-    text = raw.lower().strip()
+    text = str(raw).lower().strip()
     for pat, dst in _STAGE_MAP:
         if re.search(pat, text): return dst
     for c in CANONICAL:
@@ -193,8 +215,8 @@ SYSTEM_LAW = (
     "Do NOT invent dates or outcomes. Keep responses factual and concise."
 )
 
-def prompt_extract(thread_or_desc: str) -> str:
-    t = (thread_or_desc or "").strip()[:100_000]
+def prompt_extract(text: str) -> str:
+    t = (text or "").strip()[:100_000]
     return (
         "From the following text (emails, notes, or description), identify progression milestones in a UK residential sale. "
         "For each milestone return: stage, status (done|pending|blocked), date_iso (YYYY-MM-DD or null), "
@@ -213,7 +235,7 @@ def prompt_summary(milestones: List[Dict[str,Any]]) -> str:
     )
 
 # -------------------- LLM helpers --------------------
-def chat_json(model: str, system: str, user: str, max_tokens: int = 1400, temperature: float = 0.2) -> Dict[str, Any]:
+def chat_json(model: str, system: str, user: str, max_tokens: int = 1300, temperature: float = 0.2) -> Dict[str, Any]:
     for _ in range(2):
         r = client.chat.completions.create(
             model=model,
@@ -226,65 +248,73 @@ def chat_json(model: str, system: str, user: str, max_tokens: int = 1400, temper
         try:
             return json.loads(text)
         except Exception:
-            time.sleep(0.6)
+            time.sleep(0.5)
     raise RuntimeError("Model did not return valid JSON.")
 
 # -------------------- Utilities --------------------
+def _decode(data: bytes) -> str:
+    for enc in ("utf-8","utf-16","latin-1"):
+        try: return data.decode(enc)
+        except Exception: continue
+    return data.decode("utf-8", errors="ignore")
+
 def read_file_to_text(uploaded_file) -> str:
     name = uploaded_file.name.lower()
     data = uploaded_file.read()
     if name.endswith(".txt"):
-        try: return data.decode("utf-8")
-        except: return data.decode("latin-1", errors="ignore")
+        return _decode(data)
     if name.endswith(".pdf"):
-        reader = PdfReader(io.BytesIO(data))
-        return "\n".join(page.extract_text() or "" for page in reader.pages)
+        if PdfReader is None: return ""
+        try:
+            reader = PdfReader(io.BytesIO(data))
+            return "\n".join(page.extract_text() or "" for page in reader.pages)
+        except Exception:
+            return ""
     if name.endswith(".docx"):
-        bio = io.BytesIO(data)
-        return docx2txt.process(bio) or ""
+        if docx2txt is None: return ""
+        try:
+            return docx2txt.process(io.BytesIO(data)) or ""
+        except Exception:
+            return ""
     return ""
+
+def _to_iso(date_str: Optional[str]) -> Optional[str]:
+    if not date_str: return None
+    s = date_str.strip()
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", s): return s
+    m = re.match(r"^(\d{1,2})/(\d{1,2})/(\d{2,4})$", s)
+    if m:
+        d, mo, y = m.groups()
+        y = "20"+y if len(y)==2 else y
+        try: return dt.date(int(y), int(mo), int(d)).isoformat()
+        except Exception: return None
+    return None
 
 def normalize_rows(rows: List[Dict[str, Any]], dedupe: bool, strict_dates: bool) -> List[Dict[str, Any]]:
     norm, seen = [], set()
     for r in rows or []:
-        stage = normalize_stage(str(r.get("stage","")))
+        stage = normalize_stage(r.get("stage",""))
         status = str(r.get("status","pending")).lower()
         status = status if status in {"done","pending","blocked"} else "pending"
-        date_iso = r.get("date_iso")
-
-        # convert 18/08/25 → 2025-08-18, else keep YYYY-MM-DD, else None
-        if isinstance(date_iso, str) and date_iso.strip():
-            s = date_iso.strip()
-            if re.match(r"^\d{2}/\d{2}/\d{2,4}$", s):
-                d,m,y = s.split("/")
-                y = "20"+y if len(y)==2 else y
-                try: date_iso = dt.date(int(y), int(m), int(d)).isoformat()
-                except: date_iso = None
-            elif not re.match(r"^\d{4}-\d{2}-\d{2}$", s):
-                date_iso = None
-
+        date_iso = _to_iso(r.get("date_iso"))
         actor = str(r.get("actor") or "other").lower()
         actor = actor if actor in {"agent","solicitor","buyer","seller","lender","other"} else "other"
         details = (r.get("details") or "").strip()
         blockers = (r.get("blockers") or None)
         next_action = (r.get("next_action") or None)
-
         if strict_dates and status=="done" and not date_iso:
             status = "pending"
-
-        key = (stage, status, date_iso or "", actor, details[:80])
+        key = (stage, status, date_iso or "", actor, details[:90])
         if dedupe and key in seen: continue
         seen.add(key)
-
         norm.append({"stage":stage,"status":status,"date":date_iso,"actor":actor,
                      "details":details,"blockers":blockers,"next_action":next_action})
     return norm
 
 def compute_progress(rows: List[Dict[str,Any]]) -> float:
-    """% complete based on highest 'done' stage in canonical path (ignores 'Other' & Fall-through)."""
-    done_indices = [STAGE_ORDER.get(r["stage"], -1) for r in rows if r["status"]=="done" and r["stage"] in STAGE_ORDER]
-    if not done_indices: return 3.0  # small nudge on first step
-    last = max(done_indices)
+    done_idx = [STAGE_ORDER.get(r["stage"], -1) for r in rows if r["status"]=="done" and r["stage"] in STAGE_ORDER]
+    if not done_idx: return 3.0
+    last = max(done_idx)
     max_index = STAGE_ORDER["Completion"]
     pct = max(0.0, min(100.0, (last / max_index) * 100.0))
     return round(pct, 1)
@@ -292,7 +322,6 @@ def compute_progress(rows: List[Dict[str,Any]]) -> float:
 def enforce_caps() -> Optional[str]:
     usage = st.session_state.usage
     now = time.time()
-    # midnight reset
     today = dt.date.today().isoformat()
     if usage["date"] != today:
         usage.update({"date":today, "count":0, "last_ts":0.0})
@@ -319,38 +348,28 @@ with st.sidebar:
     c1.metric("Generations left", remain)
     c2.metric("Cooldown (s)", USAGE_COOLDOWN_SECONDS)
     if is_admin: st.success("Admin bypass active")
-
     st.markdown("---")
     st.subheader("📁 Your saved cases")
-    items = db_list_cases(UID, 25)
-    if not items:
-        st.caption("No cases saved yet.")
-    else:
-        for it in items:
-            when = dt.datetime.fromtimestamp(it["ts"]).strftime("%d %b %Y %H:%M")
-            st.write(f"• **{it['name']}** — {it['progress']}%  \n<span class='small'>{when}</span>", unsafe_allow_html=True)
-        st.caption("Cases persist per user key. (For durable cloud storage across redeploys, migrate to Supabase.)")
+    for it in db_list_cases(st.session_state.uid or "anon", 25):
+        when = dt.datetime.fromtimestamp(it["ts"]).strftime("%d %b %Y %H:%M")
+        st.write(f"• **{it['name']}** — {it['progress']}%  \n<span class='small'>{when}</span>", unsafe_allow_html=True)
 
 # -------------------- Input Modes --------------------
 st.title("📈 Sales Progression Tracker (UK)")
 st.caption("Paste emails, upload docs, or describe the process. Get progress, timeline, and next steps.")
 
-mode = st.tabs(["Emails / Notes", "Upload Documents", "Describe Process"])
-
-with mode[0]:
-    st.markdown("#### Paste emails / notes")
+tabs = st.tabs(["Emails / Notes", "Upload Documents", "Describe Process"])
+with tabs[0]:
     emails_text = st.text_area("Emails or notes (any order)", height=280, key="emails_text")
-with mode[1]:
-    st.markdown("#### Upload documents (.txt, .pdf, .docx)")
-    uploads = st.file_uploader("Attach 1–5 files", type=["txt","pdf","docx"], accept_multiple_files=True)
-with mode[2]:
-    st.markdown("#### Describe the process in your own words")
-    desc_text = st.text_area("Describe what's happened so far, who did what, and any dates", height=220, key="desc_text")
+with tabs[1]:
+    uploads = st.file_uploader("Attach files (.txt, .pdf, .docx)", type=["txt","pdf","docx"], accept_multiple_files=True)
+with tabs[2]:
+    desc_text = st.text_area("Describe what's happened so far, with dates where possible", height=220, key="desc_text")
 
 st.markdown("---")
 colA, colB, colC, colD = st.columns([1,1,1,1])
 with colA:
-    case_name = st.text_input("Case name / address (for saving)", placeholder="e.g., 12 Acacia Ave, SW1")
+    case_name = st.text_input("Case name / address (for saving)", placeholder="e.g., 20 Maunder Close, RM16 6BB")
 with colB:
     dedupe = st.checkbox("De-duplicate", value=True)
 with colC:
@@ -362,30 +381,26 @@ go = st.button("🔎 Analyse & Generate Report", type="primary", use_container_w
 
 # -------------------- Run --------------------
 if go:
-    # Build input text
-    source = "emails"
-    blob = ""
+    # Gather input
+    source = "emails"; blob = ""
     if emails_text and emails_text.strip():
         blob = emails_text.strip()
     elif uploads:
         source = "docs"
         parts = []
         for up in uploads[:5]:
-            parts.append(read_file_to_text(up))
+            txt = read_file_to_text(up)
+            if txt: parts.append(txt)
         blob = "\n\n".join(parts).strip()
     elif desc_text and desc_text.strip():
-        source = "description"
-        blob = desc_text.strip()
+        source = "description"; blob = desc_text.strip()
     else:
         st.error("Provide emails, upload documents, or enter a description first.")
         st.stop()
 
-    # Caps/cooldown
     msg = enforce_caps()
-    if msg:
-        st.warning(msg); st.stop()
+    if msg: st.warning(msg); st.stop()
 
-    # LLM extraction
     with st.spinner("Extracting milestones…"):
         try:
             j = chat_json(model, SYSTEM_LAW, prompt_extract(blob))
@@ -396,34 +411,36 @@ if go:
     rows = normalize_rows(raw_rows, dedupe=dedupe, strict_dates=strict_dates)
     df = pd.DataFrame(rows)
 
-    # Compute progress
     pct = compute_progress(rows)
 
-    # Executive summary
+    # Executive summary (guard if model returns non-JSON)
+    summary_text, bullets = "", []
     try:
         s_json = chat_json(model, SYSTEM_LAW, prompt_summary(rows), max_tokens=600)
-        summary_text = s_json.get("summary") or s_json.get("text") or ""
-        bullets = s_json.get("bullets") or []
+        if isinstance(s_json, dict):
+            summary_text = str(s_json.get("summary") or s_json.get("text") or "").strip()
+            b = s_json.get("bullets")
+            if isinstance(b, list): bullets = [str(x) for x in b if str(x).strip()]
     except Exception:
-        summary_text, bullets = "", []
+        pass
 
     # Update usage
     st.session_state.usage["count"] += 1
     st.session_state.usage["last_ts"] = time.time()
 
-    # Save case if name given
     case_id = None
     if case_name.strip():
-        case_id = db_save_case(UID, case_name.strip(), blob[:4000], source, rows, pct, summary_text)
+        case_id = db_save_case(st.session_state.uid or "anon", case_name.strip(), blob[:4000], source, rows, pct, summary_text)
 
-    # -------------------- UI: Results --------------------
+    # ======= RESULTS =======
     k1, k2, k3, k4 = st.columns(4)
-    k1.markdown(f"<div class='kpi'><b>Progress</b><br>{pct}%</div>", unsafe_allow_html=True)
-    k2.markdown(f"<div class='kpi'><b>Done</b><br>{int((df['status']=='done').sum())}</div>", unsafe_allow_html=True)
-    k3.markdown(f"<div class='kpi'><b>Pending</b><br>{int((df['status']=='pending').sum())}</div>", unsafe_allow_html=True)
-    k4.markdown(f"<div class='kpi'><b>Blocked</b><br>{int((df['status']=='blocked').sum())}</div>", unsafe_allow_html=True)
+    k1.markdown(f"<div class='kpi'><b>Progress</b><br><span style='font-size:1.25rem'>{pct}%</span></div>", unsafe_allow_html=True)
+    k2.markdown(f"<div class='kpi'><b>Done</b><br><span style='font-size:1.25rem'>{int((df['status']=='done').sum())}</span></div>", unsafe_allow_html=True)
+    k3.markdown(f"<div class='kpi'><b>Pending</b><br><span style='font-size:1.25rem'>{int((df['status']=='pending').sum())}</span></div>", unsafe_allow_html=True)
+    k4.markdown(f"<div class='kpi'><b>Blocked</b><br><span style='font-size:1.25rem'>{int((df['status']=='blocked').sum())}</span></div>", unsafe_allow_html=True)
 
     st.progress(int(pct))
+    st.markdown(f"<div class='progress-label'><span>Start</span><span>{pct:.1f}%</span><span>Completion</span></div>", unsafe_allow_html=True)
 
     left, right = st.columns([2,1], gap="large")
 
@@ -433,7 +450,7 @@ if go:
         if df.empty:
             st.info("No milestones detected.")
         else:
-            # Sort by date/status/stage
+            # order for readability
             def _key(row):
                 d = row.get("date")
                 try: t = dt.datetime.fromisoformat(d).timestamp() if d else float("inf")
@@ -447,7 +464,8 @@ if go:
                 date_txt = f" — {r['date']}" if r.get("date") else ""
                 actor = (r.get("actor") or "").capitalize()
                 det = (r.get("details") or "").strip()
-                st.markdown(f"**{badge(r['status'])} {r['stage']}**{date_txt}  \n<small class='small'>{actor}</small>  \n*{det}*", unsafe_allow_html=True)
+                st.markdown(f"**{badge(r['status'])} {r['stage']}**{date_txt}  \n"
+                            f"<span class='small'>{actor}</span>  \n*{det}*", unsafe_allow_html=True)
 
             if show_age:
                 today = dt.date.today()
